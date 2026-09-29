@@ -42,6 +42,17 @@ Logical-destruction interleavings (v1.6, ``scripts/race_destruction.py``) add:
   destruction versus in-flight recovery/migration and proving the queued, older
   session can no longer hand out shard plaintext / wrapped ciphertext nor insert
   a missed descendant once destruction wins.
+* ``destruction.after_receipt_check`` — after the idempotency-keyed receipt
+  pre-check found no existing receipt but before lineage expansion. Two
+  concurrent requests reusing one ``Idempotency-Key`` for **unrelated** roots
+  park here together (their root row locks do not overlap), so both pass the
+  pre-check and the later receipt insert hits ``uq_destruction_idem`` — pinning
+  the exact interleaving that used to surface as an unhandled database error,
+  and proving the loser now gets a deterministic ``IDEMPOTENCY_CONFLICT`` (409)
+  with its lineage destruction / shard deletion / session blocking / completion
+  audit fully rolled back. ``X-Fault-Fail: destruction.after_receipt_check:RAISE``
+  additionally proves a generic mid-transaction failure is *not* misreported as
+  an idempotency conflict.
 
 Header protocol (only honored when fault injection is enabled):
 

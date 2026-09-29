@@ -27,11 +27,21 @@ Retries carrying the same ``Idempotency-Key`` return the same receipt (200),
 even against an already-destroyed root; cross-tenant callers are rejected.
 Destruction covers **online service data only** — it never claims to erase
 external backups.
+
+Concurrent first-time uses of one key against **unrelated** roots cannot be
+serialized by the root row locks (they are disjoint), so both requests can
+pass the receipt pre-check; the loser's receipt insert then hits
+``uq_destruction_idem``. That unique-violation — and only that constraint —
+is translated into the deterministic ``IDEMPOTENCY_CONFLICT`` (409): the
+loser's whole transaction (lineage tombstones, shard deletion, session
+blocking, completion audit) rolls back, and the denial is audited in its own
+transaction, exactly as if the pre-check had seen the winner's receipt.
 """
 from __future__ import annotations
 
 import json
 
+import asyncpg
 from fastapi import APIRouter, Header, Request, Response
 
 from .. import audit, crypto, deps, faults, repo
@@ -110,6 +120,12 @@ async def destroy_lineage(
                     receipt_row = existing
                     replayed = True
                 else:
+                    # 回归闸门：回执预查通过（无既有回执）之后、谱系展开之前
+                    # （仅测试构建启用）。两个并发请求同键对不同根时，根行锁
+                    # 互不重叠，可能双双通过预查——钉住该交错可验证后插入者
+                    # 撞 uq_destruction_idem 后的确定性 409 与整体回滚。
+                    await faults.maybe_park(request, "destruction.after_receipt_check")
+                    await faults.maybe_raise(request, "destruction.after_receipt_check")
                     # ② 谱系展开 + 锁定（不动点）：每轮先按 id 顺序锁定
                     # “新发现的已完成迁移后代” custody 行，再沿其出边扩展。
                     # 与迁移完成路径同一全局锁序（custody 先于 migration 行），
@@ -229,6 +245,44 @@ async def destroy_lineage(
                     receipt_row = await conn.fetchrow(
                         "SELECT * FROM destructions WHERE id=$1", destruction_id
                     )
+        except asyncpg.UniqueViolationError as exc:
+            # 并发同键回执插入兜底：两个请求可能双双通过回执预查（不同根的
+            # 行锁互不重叠），后插入者撞上 uq_destruction_idem。唯一索引的
+            # 等待已解析，胜方回执必然已提交；本事务（谱系销毁、分片删除、
+            # 会话阻断、完成审计）已随事务上下文整体回滚。
+            if getattr(exc, "constraint_name", None) != "uq_destruction_idem":
+                # 其它唯一约束冲突（如回执主键）不是幂等冲突：原样上抛，
+                # 绝不误判为 IDEMPOTENCY_CONFLICT。
+                raise
+            # 事务已回滚：这些会话仍是 open，不得清理其进程内待累计分片。
+            open_recovery_ids = []
+            open_migration_ids = []
+            winner = await conn.fetchrow(
+                "SELECT * FROM destructions WHERE tenant_id=$1 AND idempotency_key_hash=$2",
+                tenant["id"], idem_hash,
+            )
+            if winner is None:
+                # 胜方也已回滚（回执不可见）：不是幂等冲突，原样上抛。
+                raise
+            if winner["root_custody_id"] == body.root_custody_id:
+                # 同键同根的并发重试：返回胜方那一份回执（200）。
+                receipt_row = winner
+                replayed = True
+            else:
+                # 同键不同根：与预查冲突路径同一确定性结果——409 + 拒绝审计；
+                # 失败方的谱系销毁/分片删除/会话阻断/完成审计已全部回滚。
+                conflict = ApiError(
+                    E_IDEMPOTENCY_CONFLICT,
+                    basis={"reason": "key_bound_to_different_request",
+                           "idempotency_key_digest": idem_hash},
+                )
+                await repo.audit_denied(
+                    pool, tenant_id=tenant["id"], actor_type="tenant",
+                    actor_id=tenant["id"],
+                    action="destruction.start", resource=body.root_custody_id,
+                    error_code=conflict.code, basis=conflict.basis,
+                )
+                raise conflict
         except ApiError as exc:
             await repo.audit_denied(
                 pool, tenant_id=tenant["id"], actor_type="tenant", actor_id=tenant["id"],
