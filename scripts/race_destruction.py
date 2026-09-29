@@ -35,6 +35,20 @@ real row locks) and pins every required property of logical destruction:
   D8  recovery cannot start on a destroyed custody; cross-tenant destruction and
       cross-tenant receipt GET are rejected (FORBIDDEN); receipt GET works for
       the owner; audit chain stays valid and secret-free.
+  D9  same Idempotency-Key reused concurrently against two UNRELATED root
+      custodies: both requests are parked after their receipt prechecks (so
+      both prechecks pass) and released together. Exactly one commits a 201
+      receipt; the loser gets a stable 409 IDEMPOTENCY_CONFLICT and its whole
+      transaction rolls back — the loser's lineage stays active, its encrypted
+      shards stay in the online store, its in-flight sessions stay open and its
+      destruction.complete audit never exists. A denial audit consistent with
+      the real outcome is recorded. Same key + same root concurrently retries to
+      the same receipt (201 + 200, one receipt). A later sequential retry with
+      the same key after the conflict returns the same stable 409.
+  D10 faults on the receipt-write path are never misreported as idempotency
+      conflicts: an injected generic failure (RAISE) and an injected 23505 that
+      belongs to a different constraint both roll the whole destruction back
+      (root stays active, shards remain) and surface as HTTP 500 — never 409.
 """
 from __future__ import annotations
 
@@ -59,6 +73,30 @@ from app.seed import seed, demo_credentials
 
 PASS, FAIL = "PASS", "FAIL"
 results: list[tuple[str, bool, str]] = []
+
+
+class _Raw500:
+    """Stand-in for the 500 a real HTTP client gets on an unhandled exception.
+
+    Under httpx's ASGI transport, Starlette's ServerErrorMiddleware sends the
+    500 response and then re-raises the original exception (uvicorn itself
+    swallows that re-raise); surface it as a plain 500 here.
+    """
+
+    def __init__(self, exc: BaseException):
+        self.status_code = 500
+        self.text = f"{type(exc).__name__}: {exc}"
+
+    def json(self) -> dict:
+        return {}
+
+
+async def expect_500(aw):
+    """Await a request, converting an ASGI-re-raised 500 into _Raw500."""
+    try:
+        return await aw
+    except Exception as exc:  # ASGI transport re-raises the 500-path exception
+        return _Raw500(exc)
 
 
 def check(name: str, ok: bool, detail: str = "") -> None:
@@ -126,10 +164,22 @@ async def wait_lock_waiters(pool, expect: int, like: str, timeout: float = 10.0)
     return seen
 
 
+async def wait_parkers(board: FaultBoard, gate: str, expect: int, timeout: float = 10.0) -> int:
+    deadline = asyncio.get_event_loop().time() + timeout
+    seen = 0
+    while asyncio.get_event_loop().time() < deadline:
+        seen = await board.parked_count(gate)
+        if seen >= expect:
+            return seen
+        await asyncio.sleep(0.02)
+    return seen
+
+
 class Harness:
     def __init__(self, http, pool, creds):
         self.http = http
         self.pool = pool
+        self.tenant_id = creds["tenant"]["tenant_id"]
         self.tenant_key = creds["tenant"]["api_key"]
         self.cust = {c["name"]: c for c in creds["custodians"]}
         self.secret = b"destruction-lineage-regression-secret-0123"
@@ -231,6 +281,30 @@ class Harness:
 
     async def shard_count(self, cid: str) -> int:
         return await self.pool.fetchval("SELECT count(*) FROM shards WHERE custody_id=$1", cid)
+
+    async def recovery_status(self, sid: str):
+        return await self.pool.fetchval("SELECT status FROM recovery_sessions WHERE id=$1", sid)
+
+    async def migration_status(self, mid: str):
+        return await self.pool.fetchval("SELECT status FROM migration_sessions WHERE id=$1", mid)
+
+    async def receipt_count(self) -> int:
+        return await self.pool.fetchval("SELECT count(*) FROM destructions")
+
+    async def audit_rows(self, action: str, tenant: str, resource: str | None = None):
+        rows = await self.pool.fetch(
+            "SELECT action, result, error_code, basis FROM audit_log "
+            "WHERE tenant_id=$1 AND action=$2" + (" AND resource=$3" if resource else ""),
+            tenant, action, *([resource] if resource else []),
+        )
+        out = []
+        for r in rows:
+            basis = r["basis"]
+            if isinstance(basis, str):
+                basis = json.loads(basis)
+            out.append({"action": r["action"], "result": r["result"],
+                        "error_code": r["error_code"], "basis": basis})
+        return out
 
 
 async def scenario_d1(hs: Harness, tag: str):
@@ -599,6 +673,199 @@ async def scenario_d8(hs: Harness, tag: str):
           len(des_rows) == 1 and hs.secret.hex() not in raw2 and "custody_ids" in raw2)
 
 
+async def scenario_d9(hs: Harness, board: FaultBoard, tag: str):
+    """Same Idempotency-Key reused concurrently on unrelated roots (the bug)."""
+    label = "D9(concurrent-same-key-different-root)"
+    # 两个互不相关的谱系（各自 1 次迁移、各 2 条 custody、各 6 片）。
+    chain_a = await hs.migrate_chain(f"{tag}a", hops=1)
+    chain_b = await hs.migrate_chain(f"{tag}b", hops=1)
+    root_a, root_b = chain_a[0], chain_b[0]
+    # 各自带一个在途恢复/迁移会话：失败方回滚后它们必须仍然 open。
+    sid_a = await hs.open_recovery(chain_a[1])
+    tgt_b = f"pol_d_{tag}b_open"
+    await hs.make_policy(tgt_b)
+    mid_b = await hs.open_migration(chain_b[1], tgt_b, f"d9-{tag}-migb")
+
+    same_key = f"d9-{tag}-reused-key"
+    # 两个请求都在“回执预查通过、谱系展开之前”park，随后同时放行——
+    # 复刻缺陷交错：两次预查都看不到对方的回执。
+    gk = f"destruction.after_idem_precheck:{label}"
+    gate = {"X-Fault-Key": label, "X-Fault-Gate": "destruction.after_idem_precheck"}
+    before = await hs.receipt_count()
+    task_a = asyncio.create_task(hs.destroy(root_a, same_key, gate))
+    task_b = asyncio.create_task(hs.destroy(root_b, same_key, gate))
+    parked = await wait_parkers(board, gk, 2)
+    check(f"{label}: both requests parked after their receipt prechecks",
+          parked >= 2, f"parked={parked}")
+    await board.release_gate(gk)
+    # 旧实现在此把未处理的 UniqueViolationError 抛出（500 + 无拒绝审计）：
+    # 用 _Raw500 把 ASGI 重抛的异常收敛成普通响应，使后续断言给出 FAIL 而
+    # 非让整个回归脚本崩溃。
+    ra, rb = await asyncio.gather(task_a, task_b, return_exceptions=True)
+    if isinstance(ra, BaseException):
+        ra = _Raw500(ra)
+    if isinstance(rb, BaseException):
+        rb = _Raw500(rb)
+
+    statuses = sorted([ra.status_code, rb.status_code])
+    check(f"{label}: exactly one 201 and one 409", statuses == [201, 409],
+          f"got {ra.status_code} and {rb.status_code}: {ra.text[:120]} | {rb.text[:120]}")
+    win = ra if ra.status_code == 201 else rb
+    lose = rb if win is ra else ra
+    wc, lc = body_of(win), body_of(lose)
+    check(f"{label}: loser 409 code is IDEMPOTENCY_CONFLICT",
+          lc.get("error", {}).get("code") == "IDEMPOTENCY_CONFLICT"
+          and lc["error"]["basis"].get("reason") == "concurrent_request_with_same_idempotency_key",
+          lose.text[:200])
+    # 失败方 basis 指向赢家回执与实际绑定根，客户端可据此查询/决定重试。
+    check(f"{label}: 409 basis names winner receipt and bound root",
+          lc["error"]["basis"].get("destruction_id") == wc.get("destruction_id")
+          and lc["error"]["basis"].get("bound_root_custody_id") == wc.get("root_custody_id"),
+          lose.text[:200])
+
+    # 赢家：201 回执可查询，谱系真的被销毁。
+    did = wc["destruction_id"]
+    g = await hs.http.get(f"/destructions/{did}", headers=auth(hs.tenant_key))
+    check(f"{label}: winner receipt queryable via GET",
+          g.status_code == 200 and body_of(g).get("destruction_id") == did
+          and body_of(g).get("custody_count") == 2, g.text[:160])
+
+    loser_root = root_b if wc["root_custody_id"] == root_a else root_a
+    loser_chain = chain_b if loser_root == root_b else chain_a
+    loser_sid = sid_a if loser_chain is chain_a else None
+    loser_mid = mid_b if loser_chain is chain_b else None
+
+    # 失败方：谱系销毁、分片删除、会话阻断全部回滚。
+    for cid in loser_chain:
+        check(f"{label}: loser lineage {cid[:16]}… stays active",
+              await hs.custody_status(cid) == "active", "status not rolled back")
+        check(f"{label}: loser shards restored (3 per custody)",
+              await hs.shard_count(cid) == 3, "shards deletion not rolled back")
+    if loser_sid is not None:
+        check(f"{label}: loser in-flight recovery stays open",
+              await hs.recovery_status(loser_sid) == "open")
+    if loser_mid is not None:
+        check(f"{label}: loser in-flight migration stays open",
+              await hs.migration_status(loser_mid) == "open")
+
+    # 只新增了赢家这一份回执。
+    check(f"{label}: exactly one receipt row committed",
+          await hs.receipt_count() == before + 1)
+    # 赢家的 destruction.complete 恰有一条；失败方没有任何 complete 审计。
+    completes = await hs.audit_rows("destruction.complete", hs.tenant_id)
+    winner_completes = [a for a in completes if a["basis"].get("destruction_id") == did]
+    loser_complete = [
+        a for a in completes
+        if a["basis"].get("root_custody_id") == loser_root
+        and a["basis"].get("destruction_id") != did
+    ]
+    check(f"{label}: exactly one destruction.complete (winner)",
+          len(winner_completes) == 1, f"{len(winner_completes)} winner audits")
+    check(f"{label}: loser left no destruction.complete audit",
+          len(loser_complete) == 0, "loser complete audit was not rolled back")
+
+    # 拒绝审计与实际结果一致：denied + IDEMPOTENCY_CONFLICT，恰一条，
+    # resource 为失败方自己请求的根（不是赢家的根）。
+    denied = await hs.audit_rows("destruction.start", hs.tenant_id)
+    conflict_denials = [a for a in denied if a["error_code"] == "IDEMPOTENCY_CONFLICT"
+                        and a["result"] == "denied"
+                        and a["basis"].get("destruction_id") == did]
+    check(f"{label}: exactly one IDEMPOTENCY_CONFLICT denial audit for loser root",
+          len(conflict_denials) == 1
+          and conflict_denials[0]["basis"].get("bound_root_custody_id") == wc["root_custody_id"],
+          json.dumps(denied, default=str)[:300])
+
+    # 冲突后顺序重试：同键再打失败方的根仍稳定 409；打赢家的根则 200 同回执。
+    r = await hs.destroy(loser_root, same_key)
+    check(f"{label}: sequential retry after conflict stays 409",
+          r.status_code == 409 and body_of(r)["error"]["code"] == "IDEMPOTENCY_CONFLICT", r.text[:160])
+    r = await hs.destroy(wc["root_custody_id"], same_key)
+    check(f"{label}: sequential retry against winner root replays 200 receipt",
+          r.status_code == 200 and body_of(r).get("destruction_id") == did, r.text[:160])
+
+    # ---- D9b: 同键同根并发重试 -> 201 + 200，同一份回执（由根行锁串行）。
+    label2 = "D9b(concurrent-same-key-same-root)"
+    chain = await hs.migrate_chain(f"{tag}c", hops=1)
+    root = chain[0]
+    key2 = f"d9-{tag}-same-root"
+    gk2 = f"destruction.after_idem_precheck:{label2}"
+    gate2 = {"X-Fault-Key": label2, "X-Fault-Gate": "destruction.after_idem_precheck"}
+    t1 = asyncio.create_task(hs.destroy(root, key2, gate2))
+    await board.wait_reached(gk2)
+    # 第二个请求在根行锁 FOR UPDATE 上排队（拿不到锁，进不了 gate）。
+    t2 = asyncio.create_task(hs.destroy(root, key2, gate2))
+    queued = await wait_lock_waiters(hs.pool, 1, "key_custodies")
+    check(f"{label2}: second request waits on the root custody lock", queued == 1, f"q={queued}")
+    await board.release_gate(gk2)
+    r1, r2 = await asyncio.gather(t1, t2, return_exceptions=True)
+    if isinstance(r1, BaseException):
+        r1 = _Raw500(r1)
+    if isinstance(r2, BaseException):
+        r2 = _Raw500(r2)
+    got = sorted([r1.status_code, r2.status_code])
+    check(f"{label2}: concurrent same-key same-root -> one 201 one 200",
+          got == [200, 201], f"got {got}: {r1.text[:120]} | {r2.text[:120]}")
+    check(f"{label2}: both responses carry the same receipt",
+          body_of(r1).get("destruction_id") == body_of(r2).get("destruction_id")
+          and body_of(r1).get("shards_deleted") == 6, r1.text[:160])
+    rows = await hs.pool.fetch(
+        "SELECT id FROM destructions WHERE tenant_id=$1 AND root_custody_id=$2",
+        hs.tenant_id, root)
+    check(f"{label2}: exactly one receipt row for the root", len(rows) == 1, f"{len(rows)} rows")
+
+
+async def scenario_d10(hs: Harness, tag: str):
+    """Non-idempotency receipt-write failures must roll back and stay 500."""
+    label = "D10(other-db-errors-not-idempotency)"
+    chain = await hs.migrate_chain(tag, hops=1)
+    root = chain[0]
+
+    # ① 回执写入前注入普通故障（RuntimeError，模拟连接中止/内部异常）。
+    before = await hs.receipt_count()
+    r = await expect_500(hs.destroy(root, f"d10-{tag}-raise", {
+        "X-Fault-Fail": "destruction.before_receipt_insert:RAISE"}))
+    check(f"{label}: generic receipt-write failure surfaces as 500",
+          r.status_code == 500, f"{r.status_code} {r.text[:120]}")
+    for cid in chain:
+        check(f"{label}: generic failure fully rolled back ({cid[:12]}… active, 3 shards)",
+              await hs.custody_status(cid) == "active" and await hs.shard_count(cid) == 3)
+    check(f"{label}: no receipt row after generic failure",
+          await hs.receipt_count() == before)
+
+    # ② 注入一个命中“别的唯一约束”的 23505：绝不可被判为 IDEMPOTENCY_CONFLICT。
+    r = await expect_500(hs.destroy(root, f"d10-{tag}-uq", {
+        "X-Fault-Fail": "destruction.before_receipt_insert:UNIQUE_VIOLATION_OTHER"}))
+    check(f"{label}: 23505 on another constraint is 500, not 409",
+          r.status_code == 500 and "IDEMPOTENCY_CONFLICT" not in r.text,
+          f"{r.status_code} {r.text[:160]}")
+    for cid in chain:
+        check(f"{label}: other-constraint failure fully rolled back ({cid[:12]}…)",
+              await hs.custody_status(cid) == "active" and await hs.shard_count(cid) == 3)
+    check(f"{label}: no receipt row after other-constraint failure",
+          await hs.receipt_count() == before)
+    # 两种 500 都不产生 destruction.complete（随事务回滚），也不产生 denied
+    # 审计（通用错误路径，不是确定性 4xx 拒绝）。按本次两个幂等键的摘要过滤。
+    from app.crypto import sha256_hex
+    d10_hashes = {sha256_hex(f"d10-{tag}-raise".encode()),
+                  sha256_hex(f"d10-{tag}-uq".encode())}
+    denied = await hs.audit_rows("destruction.start", hs.tenant_id)
+    d10_denials = [a for a in denied
+                   if a["basis"].get("idempotency_key_digest") in d10_hashes]
+    check(f"{label}: no complete/denied audit committed by D10 500 paths",
+          len(d10_denials) == 0, json.dumps(d10_denials, default=str)[:200])
+    completes = await hs.audit_rows("destruction.complete", hs.tenant_id)
+    d10_completes = [a for a in completes
+                     if a["basis"].get("idempotency_key_digest") in d10_hashes]
+    check(f"{label}: no destruction.complete committed by D10 500 paths",
+          len(d10_completes) == 0)
+
+    # ③ 回滚之后用新键可以正常销毁——失败没有留下占位。
+    r = await hs.destroy(root, f"d10-{tag}-recover")
+    check(f"{label}: clean retry with a new key after rollback -> 201",
+          r.status_code == 201 and body_of(r).get("custody_count") == 2
+          and body_of(r).get("shards_deleted") == 6, r.text[:160])
+
+
 async def amain() -> int:
     async with server() as (http, pool, board):
         creds = demo_credentials()
@@ -612,6 +879,8 @@ async def amain() -> int:
         await scenario_d6(hs, board, f"{suffix}6")
         await scenario_d7(hs, f"{suffix}7")
         await scenario_d8(hs, f"{suffix}8")
+        await scenario_d9(hs, board, f"{suffix}9")
+        await scenario_d10(hs, f"{suffix}0")
 
         r = await http.get("/audit/replay", headers=auth(hs.tenant_key))
         check("final: audit hash chain valid across destruction scenarios",

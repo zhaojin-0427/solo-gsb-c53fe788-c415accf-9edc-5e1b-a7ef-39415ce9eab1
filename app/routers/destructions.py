@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 
+import asyncpg
 from fastapi import APIRouter, Header, Request, Response
 
 from .. import audit, crypto, deps, faults, repo
@@ -39,6 +40,10 @@ from ..errors import ApiError, E_BAD_REQUEST, E_FORBIDDEN, E_IDEMPOTENCY_CONFLIC
 from ..schemas import DestructionReceiptOut, DestructionStartIn
 
 router = APIRouter(tags=["destructions"])
+
+# destructions 幂等回执唯一索引（见 app/db.py SCHEMA）。命中该索引才是
+# “同键并发”，其他 23505（或任何其他约束错误）一律不得判为幂等冲突。
+_IDEM_UNIQUE_CONSTRAINT = "uq_destruction_idem"
 
 
 def _receipt_out(row) -> DestructionReceiptOut:
@@ -102,14 +107,24 @@ async def destroy_lineage(
                 )
                 if existing is not None:
                     if existing["root_custody_id"] != body.root_custody_id:
+                        # 与同键并发冲突（见下方 savepoint 路径）保持同样的
+                        # basis：给出赢家回执 id 与其实际绑定根，客户端可直接
+                        # GET 回执，或换新键销毁自己的根。
                         raise ApiError(
                             E_IDEMPOTENCY_CONFLICT,
                             basis={"reason": "key_bound_to_different_request",
-                                   "idempotency_key_digest": idem_hash},
+                                   "idempotency_key_digest": idem_hash,
+                                   "destruction_id": existing["id"],
+                                   "bound_root_custody_id": existing["root_custody_id"]},
                         )
                     receipt_row = existing
                     replayed = True
                 else:
+                    # 回归闸门：幂等回执预查已通过、谱系尚未展开（仅测试构建
+                    # 启用）。两个同键请求可在此精确交错：放行后唯一索引
+                    # uq_destruction_idem 成为最终仲裁，恰有一次 INSERT 成功。
+                    await faults.maybe_park(request, "destruction.after_idem_precheck")
+
                     # ② 谱系展开 + 锁定（不动点）：每轮先按 id 顺序锁定
                     # “新发现的已完成迁移后代” custody 行，再沿其出边扩展。
                     # 与迁移完成路径同一全局锁序（custody 先于 migration 行），
@@ -196,39 +211,79 @@ async def destroy_lineage(
 
                     # ⑧ 幂等销毁回执（只含 ID/计数，无任何秘密材料）。
                     destruction_id = deps.new_id("des")
-                    await conn.execute(
-                        """
-                        INSERT INTO destructions
-                          (id, tenant_id, root_custody_id, idempotency_key_hash,
-                           custody_count, recovery_blocked, migration_blocked,
-                           shards_deleted, custody_ids, status)
-                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,'completed')
-                        """,
-                        destruction_id, tenant["id"], root["id"], idem_hash,
-                        len(lineage), recovery_blocked, migration_blocked,
-                        shards_deleted, json.dumps(lineage),
-                    )
+                    # 回归闸门：谱系销毁（⑤⑥⑦）已完成、回执 INSERT 即将执行。
+                    # 用于注入“回执写入阶段的非幂等类故障”，验证该类失败
+                    # 整体回滚且不会被误判为 IDEMPOTENCY_CONFLICT。
+                    await faults.maybe_raise(request, "destruction.before_receipt_insert")
+                    # savepoint：唯一索引兜底命中后，外层事务仍可用于重读、
+                    # 留痕并返回确定性结果（与 /migrations 创建同构）。
+                    try:
+                        async with conn.transaction():
+                            await conn.execute(
+                                """
+                                INSERT INTO destructions
+                                  (id, tenant_id, root_custody_id, idempotency_key_hash,
+                                   custody_count, recovery_blocked, migration_blocked,
+                                   shards_deleted, custody_ids, status)
+                                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,'completed')
+                                """,
+                                destruction_id, tenant["id"], root["id"], idem_hash,
+                                len(lineage), recovery_blocked, migration_blocked,
+                                shards_deleted, json.dumps(lineage),
+                            )
+                    except asyncpg.PostgresError as exc:
+                        # 只有“命中幂等回执唯一索引”才是同键并发；任何其他
+                        # 约束（含其他 23505）都不是幂等冲突——原样抛出，让
+                        # 外层事务整体回滚，由通用错误路径处理（HTTP 500）。
+                        code = getattr(exc, "pgcode", None) or getattr(exc, "sqlstate", None)
+                        if code != "23505" or getattr(exc, "constraint_name", None) != _IDEM_UNIQUE_CONSTRAINT:
+                            raise
+                        # 同键并发的另一请求已提交回执。读已提交下该新行此刻
+                        # 必可见：同根视为并发重放（200 同回执），换根为
+                        # 稳定的 409 IDEMPOTENCY_CONFLICT。无论哪种，本请求
+                        # 此前在同一事务内完成的谱系销毁/分片删除/会话阻断都
+                        # 随外层事务一并回滚——赢家的实际结果是唯一结果。
+                        winner = await conn.fetchrow(
+                            "SELECT * FROM destructions "
+                            "WHERE tenant_id=$1 AND idempotency_key_hash=$2",
+                            tenant["id"], idem_hash,
+                        )
+                        if winner is None:
+                            # 找不到竞胜者：23505 来自其他约束/异常状态，
+                            # 绝不可误判为幂等冲突——还原成原始数据库错误。
+                            raise
+                        if winner["root_custody_id"] != body.root_custody_id:
+                            raise ApiError(
+                                E_IDEMPOTENCY_CONFLICT,
+                                basis={"reason": "concurrent_request_with_same_idempotency_key",
+                                       "idempotency_key_digest": idem_hash,
+                                       "destruction_id": winner["id"],
+                                       "bound_root_custody_id": winner["root_custody_id"]},
+                            )
+                        receipt_row = winner
+                        replayed = True
 
                     # ⑨ 可重放审计：无明文（分片/秘密/nonce 均不入 basis）。
-                    await audit.append_audit(
-                        conn, tenant_id=tenant["id"], actor_type="tenant",
-                        actor_id=tenant["id"],
-                        action="destruction.complete", resource=destruction_id, result="ok",
-                        basis={
-                            "destruction_id": destruction_id,
-                            "root_custody_id": root["id"],
-                            "custody_count": len(lineage),
-                            "custody_ids": lineage,
-                            "recovery_blocked": recovery_blocked,
-                            "migration_blocked": migration_blocked,
-                            "shards_deleted": shards_deleted,
-                            "scope": "online_service_data_only",
-                            "idempotency_key_digest": idem_hash,
-                        },
-                    )
-                    receipt_row = await conn.fetchrow(
-                        "SELECT * FROM destructions WHERE id=$1", destruction_id
-                    )
+                    if receipt_row is None:
+                        await audit.append_audit(
+                            conn, tenant_id=tenant["id"], actor_type="tenant",
+                            actor_id=tenant["id"],
+                            action="destruction.complete", resource=destruction_id, result="ok",
+                            basis={
+                                "destruction_id": destruction_id,
+                                "root_custody_id": root["id"],
+                                "custody_count": len(lineage),
+                                "custody_ids": lineage,
+                                "recovery_blocked": recovery_blocked,
+                                "migration_blocked": migration_blocked,
+                                "shards_deleted": shards_deleted,
+                                "scope": "online_service_data_only",
+                                "idempotency_key_digest": idem_hash,
+                            },
+                        )
+                        receipt_row = await conn.fetchrow(
+                            "SELECT * FROM destructions WHERE id=$1", destruction_id
+                        )
         except ApiError as exc:
             await repo.audit_denied(
                 pool, tenant_id=tenant["id"], actor_type="tenant", actor_id=tenant["id"],

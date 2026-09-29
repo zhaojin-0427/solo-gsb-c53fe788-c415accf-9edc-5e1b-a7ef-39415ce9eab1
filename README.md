@@ -14,6 +14,21 @@ v1.4 新增**跨策略密钥迁移**：租户对仍有效的托管记录指定�
 
 技术栈：Python 3.12 · FastAPI · PostgreSQL 16 · `cryptography` · Docker Compose。
 
+> **修复要点（v1.6）**：修复销毁回执在**并发复用同一幂等键**时的错误。旧实现只在事务开头
+> 对 `destructions` 做一次回执预查：同一租户同时以相同 `Idempotency-Key` 对**互不相关的两个
+> 根托管记录**发起 `POST /destructions` 时，两次请求都可能通过预查、各自完成谱系销毁，最后
+> 后插入者撞上 `uq_destruction_idem` 唯一索引，冒出**未处理的数据库错误（HTTP 500）**，
+> 且没有留下约定的拒绝审计；失败方的谱系销毁/分片删除/会话阻断虽随事务回滚，但客户端得到
+> 的是不可重试的 500 而不是确定的 409。现把回执 INSERT 包进**内层 savepoint**：命中唯一索引时
+> 只在确认 **23505 且约束名恰为 `uq_destruction_idem`** 且能在同事务重读中找到竞胜者回执时，
+> 才把它翻译为确定结果——**换根**返回稳定的 `409 IDEMPOTENCY_CONFLICT`（basis 带赢家
+> `destruction_id` / `bound_root_custody_id`，拒绝审计与实际结果一致），**同根**视为并发重放
+> 返回 `200` 同一回执；竞胜者不存在或 23505 来自任何其他约束（以及任何其他数据库错误）一律
+> **原样上抛、整体回滚为 500，绝不误判为幂等冲突**。如此保证：同键换根并发恰有一次 `201`
+> 与可查询回执、另一次稳定 `409`，失败方的谱系销毁、分片删除、会话阻断与完成审计全部回滚；
+> 同键同根并发重试（根行锁天然串行）仍返回同一份回执。可精确控制“回执预查交错”的回归见
+> `scripts/race_destruction.py` 的 **D9/D9b/D10**。
+>
 > **新功能（v1.6）托管记录谱系逻辑销毁**：租户对任一托管记录携带**幂等键**发起逻辑销毁
 > （`POST /destructions`）。服务沿**已完成的迁移关系**（`migration_sessions.new_custody_id`）
 > 找出指定记录及其**全部后代**，在**同一事务**、按与迁移/恢复路径一致的全局行锁序
@@ -27,7 +42,7 @@ v1.4 新增**跨策略密钥迁移**：租户对仍有效的托管记录指定�
 > 提交，销毁的谱系展开会把新生后代一并纳入并删除其分片。同键重试返回**同一份销毁回执**
 > （200），同键换根为 `IDEMPOTENCY_CONFLICT`，跨租户请求一律 `FORBIDDEN`。销毁**仅覆盖服务
 > 在线数据**（回执 `scope=online_service_data_only`），**不宣称擦除数据库/存储的外部备份**。
-> 并发交错的回归验证见 `scripts/race_destruction.py`（D1–D8）。
+> 并发交错的回归验证见 `scripts/race_destruction.py`（D1–D10，80 项断言）。
 
 > **修复要点（v1.5）**：修复**跨策略迁移在待累计分片丢失后卡死**的问题。旧代码里，首名托管人
 > 已提交分片（数据库计数=1）后若 API 进程重启或内存池淘汰该分片，另一名托管人的提交会让
@@ -62,7 +77,7 @@ v1.4 新增**跨策略密钥迁移**：租户对仍有效的托管记录指定�
 > 目标=源均被拒；会话 TTL 或源侧失效后旧 open 会话惰性置 `expired`，调用方可安全重试。
 > 确定性拒绝（验签/点位/摘要/nonce/成员）不花费 nonce；入池后的失败沿用 v1.3 的双重撤销边界
 > （行锁释放前先凭 token 撤回内存分片再回滚）。端到端与存储层断言见 `scripts/demo.py`
-> （108 项，迁移用例覆盖正常流程、每类拒绝依据、并发重复、TTL 安全重试与存储层无明文）。
+> （128 项，迁移用例覆盖正常流程、每类拒绝依据、并发重复、TTL 安全重试与存储层无明文）。
 
 > **修复要点（v1.3）**：修复 `/recoveries/shares` 在“分片**已入内存池之后**异常回滚”时的交错竞态
 > （重组失败、审计写入失败、连接中止等）。旧代码在异常路径上**先 `ROLLBACK` 释放会话行锁、
@@ -136,8 +151,9 @@ docker compose exec api python -m app.seed
 ```bash
 # 1) 并发回滚竞态回归（scripts.race_recovery，38 项）
 # 2) 迁移缺片故障转移回归（scripts.race_migration，37 项）
-# 3) 谱系逻辑销毁回归（scripts.race_destruction，D1–D8）
-# 4) 端到端验收（scripts.demo，含销毁全流程）
+# 3) 谱系逻辑销毁回归（scripts.race_destruction，80 项；D9/D9b/D10 钉住
+#    同键换根并发 201+409、同键同根并发同一回执、其他 DB 约束错误不误判）
+# 4) 端到端验收（scripts.demo，128 项，含销毁全流程）
 docker compose --profile demo run --rm demo
 ```
 
@@ -157,7 +173,13 @@ docker compose --profile demo run --rm demo
 `scripts.race_destruction.py` 钉住**逻辑销毁 × 迁移完成/分片领取/份额提交**的行锁交错
 （销毁在持谱系 custody 锁、会话锁前 park，使在途请求排队）：断言先后确定、输掉交错的旧会话
 只得到 `CUSTODY_DESTROYED`（不再下发分片/密文、不产生漏删后代）、迁移先赢时新后代必被纳入
-销毁、同键返回同一回执、跨租户拒绝、待累计分片在提交后清空。
+销毁、同键返回同一回执、跨租户拒绝、待累计分片在提交后清空。**D9/D9b** 通过新增的
+`destruction.after_idem_precheck` 闸门把两个同键请求都钉在“回执预查刚通过”的位置后一起
+放行，精确复刻同键换根并发：断言恰有一次 `201`（回执可 GET）、另一次稳定
+`409 IDEMPOTENCY_CONFLICT` 且失败方的谱系/分片/在途会话/完成审计全部回滚、拒绝审计与
+赢家实际结果一致、冲突后顺序重试语义确定；同键同根并发则由根行锁串行成 `201 + 200`
+同一回执。**D10** 在 `destruction.before_receipt_insert` 注入普通故障与“命中别的唯一
+约束”的 23505，断言两者都整体回滚且返回 500，**绝不误判**为幂等冲突。
 本地单独运行：
 
 ```bash
@@ -375,9 +397,32 @@ curl -s -X POST localhost:8000/destructions -H "X-API-Key: $TENANT" \
   -H 'Content-Type: application/json' -H 'Idempotency-Key: destroy-2026-09-29-0001' \
   -d '{"root_custody_id":"cus_secret_..."}'
 
+# (2b) 同键换根的并发冲突 -> 409 IDEMPOTENCY_CONFLICT
+# 同一租户用同一个 Idempotency-Key 对“另一个根”并发发起时，恰有一次请求得到 201，
+# 输掉的请求稳定得到 409（不再是未处理的 500）。basis 指向赢家回执与其实际绑定根：
+# {"error":{"code":"IDEMPOTENCY_CONFLICT",
+#   "basis":{"reason":"concurrent_request_with_same_idempotency_key",
+#            "destruction_id":"des_...",            # 赢家回执，可直接 GET
+#            "bound_root_custody_id":"cus_secret_..."}}}
+
 # (3) 查询销毁回执（排障/合规留存）
 curl -s localhost:8000/destructions/des_... -H "X-API-Key: $TENANT"
 ```
+
+**冲突后如何重试**（409 `IDEMPOTENCY_CONFLICT` 的确定性处置）：
+
+- 409 **不会改变任何数据**：失败方事务整体回滚，其谱系仍为 `active`、在线分片仍在、
+  在途恢复/迁移会话仍为 `open`，也不产生 `destruction.complete` 审计；只有赢家那一份
+  回执与完成审计落库（拒绝审计 `destruction.start/denied` 与该结果一致，可重放）。
+- 幂等键的语义是“**一个键 = 一次确定的请求**”，不能复用到另一个根：
+  - 若你本意销毁的就是**赢家绑定的根**（`basis.bound_root_custody_id`），直接
+    `GET /destructions/{basis.destruction_id}` 取回同一份回执即可，或用同键+同根
+    再 POST 一次，得到 `200` 同回执；
+  - 若你确实要销毁**自己原来的那个根**，**换一个新的 `Idempotency-Key`** 重新 POST，
+    即可正常拿到 `201`（它的谱系未受影响，无需任何补偿动作）；
+  - 顺序重放旧键旧根仍稳定得到同一个 `409`（冲突结果可复现，不会随时间漂移）。
+- 只有命中 `uq_destruction_idem` 的 23505 才会被翻译为该 409；其他数据库故障一律是
+  `500 INTERNAL_ERROR`（整个销毁已回滚，可换新键安全重试），不会被误判成幂等冲突。
 
 销毁提交后，谱系上旧会话的一切请求确定性返回 `CUSTODY_DESTROYED`（HTTP 410），
 `GET /recoveries/{id}` / `GET /migrations/{id}` 可见 `status=destroyed`：
@@ -480,7 +525,7 @@ curl -s localhost:8000/audit/replay -H "X-API-Key: $TENANT"
 | `CROSS_POLICY_SHARE` | 托管人不属于该策略版本，或 nonce/领取/提交绑定的会话、托管人不匹配 |
 | `SESSION_COMPLETED` / `SESSION_EXPIRED` | 会话已完成（密文只下发一次）/ 已过 TTL |
 | `THRESHOLD_NOT_MET` / `INTEGRITY_CHECK_FAILED` | 有效分片不足（含重启后内存待累计分片丢失 `pending_shares_unavailable`）/ 重组结果摘要不匹配 |
-| `IDEMPOTENCY_CONFLICT` | `Idempotency-Key` 已绑定另一个不同的迁移请求，或同键并发正在创建 |
+| `IDEMPOTENCY_CONFLICT` | `Idempotency-Key` 已绑定另一个不同请求（含同键换根的并发：恰有一次 201，败者稳定 409，basis 给出赢家 `destruction_id`/`bound_root_custody_id`；换新键重试自己的根即可），或同键并发正在创建 |
 | `MIGRATION_TARGET_INVALID` | 目标策略版本不存在、已撤销/已过期、属于其他租户，或与源版本相同 |
 | `MIGRATION_SOURCE_INVALID` | 源托管记录非 active（已轮换/撤销）或源策略版本已撤销/过期，不能发起迁移 |
 | `MIGRATION_DIGEST_MISMATCH` | 会话绑定的源/目标策略版本摘要与不可变版本行不符（完整性兜底） |
@@ -583,7 +628,11 @@ open 唯一索引，等待中的旧会话请求只得 `MIGRATION_FAILED`，租�
 谱系上 `open` 的恢复/迁移会话置 `destroyed` 终态、写 `destruction.complete` 审计与幂等回执；
 事务**提交成功后**才按会话键 `pending.clear()` 清掉进程内待累计分片（沿用“提交后清内存”的边界，
 失败整体回滚则不清）。销毁回执 `destructions` 以 `(tenant_id, idempotency_key_hash)` 唯一约束
-保证同键重试永远返回同一份回执；销毁只覆盖**在线服务数据**（回执
+（`uq_destruction_idem`）保证同键重试永远返回同一份回执；回执 INSERT 在**内层 savepoint** 中
+执行——同键换根并发时败者在此撞索引，经“约束名白名单 + 同事务重读竞胜者”双重确认后翻译为
+稳定的 `409 IDEMPOTENCY_CONFLICT`（并补与结果一致的拒绝审计），其谱系销毁/分片删除/会话阻断
+随外层事务整体回滚；同键同根并发由根 custody 行锁天然串行成 `201 + 200` 同一回执；任何其他
+约束错误（含其他 23505）都原样上抛为 500，绝不误判为幂等冲突。销毁只覆盖**在线服务数据**（回执
 `scope=online_service_data_only`），**不宣称擦除外部备份**——快照/备份/对象存储版本/客户端缓存
 等副本的擦除须由其自身生命周期与介质策略保证。
 
@@ -608,7 +657,7 @@ uvicorn app.main:app --reload --port 8000
 KEYVAULT_BASE_URL=http://localhost:8000 python -m scripts.demo       # 端到端验收（含跨策略迁移与谱系销毁）
 KEYVAULT_FAULT_INJECTION=1 python -m scripts.race_recovery           # 并发回滚竞态回归（38 项）
 KEYVAULT_FAULT_INJECTION=1 python -m scripts.race_migration          # 迁移缺片故障转移回归（37 项）
-KEYVAULT_FAULT_INJECTION=1 python -m scripts.race_destruction        # 谱系逻辑销毁并发回归（D1–D8）
+KEYVAULT_FAULT_INJECTION=1 python -m scripts.race_destruction        # 谱系逻辑销毁并发回归（D1–D10，80 项）
 ```
 
 ## 6. 生产注意（本仓库为演示强化基线，上线前至少完成）
